@@ -89,8 +89,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BOT_TOKEN = "8735710065:AAHcrfnLjSkHVBrTQG0_22B2bQjc-eahlqk"
-MONGO_URI = "mongodb+srv://echoharmonic21_db_user:echoharmonic21_db_user@cluster0.tsbqkq0.mongodb.net/?appName=Cluster0"
-DB_NAME = "echoharmonic21_db_user"
+MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster0"
+DB_NAME = "Alizenx"
 SUDO_USERS = [8536019525]
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", BOT_TOKEN)
