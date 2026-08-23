@@ -1,0 +1,33 @@
+services:
+  - type: worker           # No open port needed -- long-polling mode.
+    name: telegram-filter-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python filterbot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # set manually in the Render dashboard
+      - key: MONGO_URI
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: SUDO_USERS
+        sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: BOT_USERNAME_FOR_ADD
+        sync: false
+      - key: OWNER_URL
+        sync: false
+      - key: UPDATES_URL
+        sync: false
+      - key: START_IMAGE_URL
+        sync: false
+      - key: BOT_NAME
+        sync: false
+
+# If you instead want to run this as a Web Service (webhook mode), change
+# `type: worker` to `type: web` and add:
+#   - key: WEBHOOK_URL
+#     sync: false   # set to https://<your-service>.onrender.com after first deploy
