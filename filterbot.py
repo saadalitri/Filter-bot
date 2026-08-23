@@ -71,6 +71,8 @@ import random
 import asyncio
 import logging
 import shlex
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -927,6 +929,32 @@ async def new_chat_member_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
 
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    """Answers every request with a plain 200 OK. Used only so Render's port
+    scan succeeds and an uptime monitor has something to ping -- it has no
+    connection to the Telegram bot logic itself."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # silence per-request logging spam from uptime pings
+
+
+def _start_health_server(port: int):
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health-check server listening on 0.0.0.0:{port}")
+
+
 async def post_init(application: Application):
     await ensure_indexes()
     logger.info("Database indexes ready.")
@@ -1032,8 +1060,15 @@ def main():
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # Background Worker mode: plain long-polling, no open port needed.
-        logger.info("Starting bot in polling mode...")
+        # Polling mode doesn't need a port on its own, but Render's port
+        # scan (and an uptime monitor like UptimeRobot pinging the service
+        # to keep a free-tier instance awake) both need something to hit.
+        # Without this, Render logs "No open ports detected" and may
+        # restart the service, which can briefly run two bot instances at
+        # once and trigger Telegram's "Conflict: terminated by other
+        # getUpdates request" error. This tiny server just answers "OK".
+        _start_health_server(PORT)
+        logger.info(f"Starting bot in polling mode (health server on port {PORT})...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
