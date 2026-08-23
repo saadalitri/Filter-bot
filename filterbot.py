@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 #  works unchanged if you later deploy somewhere that injects them)
 # ============================================================
 
-BOT_TOKEN = "8735710065:AAHcrfnLjSkHVBrTQG0_22B2bQjc-eahlqk"
+BOT_TOKEN = "8838446349:AAG_Dv0xt7mi7UTnqxLcTY21y54TLPBOweQ"
 MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster0"
 DB_NAME = "Alizenx"
 SUDO_USERS = [8536019525]
@@ -267,18 +267,39 @@ BUTTON_REGEX = re.compile(r"\[([^\[\]]+)\]\(buttonurl:(?://)?(.+?)\)", re.IGNORE
 
 
 def parse_buttons(text: str):
-    buttons = []
+    """Extracts [Label](buttonurl:...) tags and groups them into rows.
+    Two buttons written on the SAME line (no newline between them) end up
+    side-by-side in one row, e.g.:
+        [Main Channel](buttonurl:...) [Index](buttonurl:...)
+        [Eric Anime Verse](buttonurl:...)
+    produces a 2-button row followed by a 1-button row -- matching the
+    familiar Rose-bot-style layout."""
+    rows = []
+    last_end = None
     for match in BUTTON_REGEX.finditer(text):
         label, url = match.group(1).strip(), match.group(2).strip()
-        buttons.append([label, url])
+        between = text[last_end:match.start()] if last_end is not None else None
+        if rows and between is not None and "\n" not in between:
+            rows[-1].append([label, url])
+        else:
+            rows.append([[label, url]])
+        last_end = match.end()
     clean_text = BUTTON_REGEX.sub("", text).strip()
-    return clean_text, buttons
+    return clean_text, rows
 
 
 def build_markup(buttons):
+    """Accepts either the new row-grouped format (list of rows, each a list
+    of [label, url]) or the old flat format (list of [label, url]) saved by
+    earlier versions of this bot, so existing filters keep working."""
     if not buttons:
         return None
-    keyboard = [[InlineKeyboardButton(label, url=url)] for label, url in buttons]
+    if isinstance(buttons[0][0], str):
+        # Legacy flat format -- one button per row.
+        rows = [[b] for b in buttons]
+    else:
+        rows = buttons
+    keyboard = [[InlineKeyboardButton(label, url=url) for label, url in row] for row in rows]
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -471,11 +492,13 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Preserve any URL buttons already attached to the replied message,
         # so filters keep working links (e.g. Tutorial / Watch / Download).
+        # Row structure is preserved too, so a 2-buttons-per-row layout stays
+        # 2-buttons-per-row instead of collapsing to one button per row.
         if replied.reply_markup and replied.reply_markup.inline_keyboard:
             for row in replied.reply_markup.inline_keyboard:
-                for btn in row:
-                    if getattr(btn, "url", None):
-                        original_buttons.append([btn.text, btn.url])
+                row_buttons = [[btn.text, btn.url] for btn in row if getattr(btn, "url", None)]
+                if row_buttons:
+                    original_buttons.append(row_buttons)
 
     if not reply_text and not file_id:
         await message.reply_text("⚠️ Provide reply text, or reply to a message/media to save.")
@@ -551,25 +574,36 @@ async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_id = update.effective_chat.id
     markup = build_markup(doc.get("buttons"))
     sent_msg = None
+    trigger_id = update.effective_message.message_id if update.effective_message else None
 
-    if doc.get("file_id"):
-        if doc["file_type"] == "sticker":
-            sent_msg = await context.bot.send_sticker(chat_id, doc["file_id"])
-        else:
+    async def _send(reply_to):
+        if doc.get("file_id"):
+            if doc["file_type"] == "sticker":
+                return await context.bot.send_sticker(chat_id, doc["file_id"], reply_to_message_id=reply_to)
             send_map = {
                 "photo": context.bot.send_photo, "video": context.bot.send_video,
                 "document": context.bot.send_document, "animation": context.bot.send_animation,
                 "audio": context.bot.send_audio, "voice": context.bot.send_voice,
             }
             sender = send_map[doc["file_type"]]
-            sent_msg = await sender(
+            return await sender(
                 chat_id=chat_id, **{doc["file_type"]: doc["file_id"]},
                 caption=doc.get("reply_text") or None, reply_markup=markup,
+                reply_to_message_id=reply_to,
             )
-    else:
-        sent_msg = await context.bot.send_message(
-            chat_id=chat_id, text=doc.get("reply_text") or "‎", reply_markup=markup
+        return await context.bot.send_message(
+            chat_id=chat_id, text=doc.get("reply_text") or "‎", reply_markup=markup,
+            reply_to_message_id=reply_to,
         )
+
+    try:
+        # Reply/quote the message that triggered the filter, like Rose-bot does.
+        sent_msg = await _send(trigger_id)
+    except Exception:
+        # The triggering message may have been deleted, or replies may be
+        # restricted in this chat -- fall back to a plain (non-reply) send
+        # instead of failing silently.
+        sent_msg = await _send(None)
 
     await increment_uses(chat_id, doc["name"])
 
