@@ -122,7 +122,7 @@ SUPPORT_TEXT = (
 )
 # Just the bot's @username, WITHOUT the leading "@" (fixed — the original had
 # "@Filter_Assistbot" which broke the "Add me to your group" link).
-BOT_USERNAME_FOR_ADD = "Filter_Assistbot"
+BOT_USERNAME_FOR_ADD = "@Filter_Assistbot"
 
 GENRES = {"action", "romance", "comedy", "horror", "drama", "thriller", "sci-fi", "animation"}
 RANDOM_KEYWORDS = {"suggest", "best", "random", "recommend", "surprise me"}
@@ -323,6 +323,47 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     return False
 
 
+async def resolve_target_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Figures out which chat a filter-management command should act on.
+    Inside a group, that's just the current chat. In a private chat (DM),
+    it's whichever group the user has connected via /connect -- since
+    filters live per-chat_id, running /add in DM without this would only
+    ever touch the DM's own (useless) filter list instead of the group's."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        return chat.id
+    return await get_connection(update.effective_user.id)
+
+
+async def require_admin_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resolves the target chat (see resolve_target_chat_id) AND verifies the
+    calling user is an admin there. Returns the chat_id to operate on, or
+    None (after sending an explanatory reply) if that's not possible --
+    replacing the old shortcut that let DMs bypass the admin check entirely
+    without actually checking the connected group."""
+    message = update.effective_message
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
+        return None
+
+    user_id = update.effective_user.id
+    if user_id in SUDO_USERS:
+        return chat_id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        await message.reply_text("⚠️ I couldn't verify your admin status there (am I still a member of that group?).")
+        return None
+    if member.status not in ("administrator", "creator"):
+        await message.reply_text("⚠️ You need to be an admin in that chat to use this command.")
+        return None
+    return chat_id
+
+
 async def send_log(context: ContextTypes.DEFAULT_TYPE, text: str):
     """Posts an event to the configured log channel. Silently does nothing
     if no LOG_CHANNEL_ID is set, and never lets a logging failure crash a
@@ -449,7 +490,8 @@ async def donate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
 
     message = update.effective_message
@@ -510,20 +552,26 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
 
     await add_filter(
-        chat_id=update.effective_chat.id, name=name, reply_text=clean_text,
+        chat_id=chat_id, name=name, reply_text=clean_text,
         buttons=all_buttons, file_id=file_id, file_type=file_type,
     )
-    await message.reply_text(f"✅ Filter '{name}' saved.")
+    try:
+        target_chat = await context.bot.get_chat(chat_id)
+        chat_label = target_chat.title or chat_id
+    except Exception:
+        chat_label = chat_id
+    await message.reply_text(f"✅ Filter '{name}' saved" + (f" in '{chat_label}'." if update.effective_chat.type == "private" else "."))
     await send_log(
         context,
         f"➕ Filter added: <code>{name}</code>\n"
-        f"Chat: {update.effective_chat.title or update.effective_chat.id} (<code>{update.effective_chat.id}</code>)\n"
+        f"Chat: {chat_label} (<code>{chat_id}</code>)\n"
         f"By: {update.effective_user.mention_html()}",
     )
 
 
 async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
 
     raw = update.effective_message.text or ""
@@ -541,35 +589,82 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     name = tokens[0]
-    ok = await delete_filter(update.effective_chat.id, name)
+    ok = await delete_filter(chat_id, name)
     if ok:
         await update.effective_message.reply_text(f"🗑 Filter '{name}' deleted.")
         await send_log(
             context,
             f"➖ Filter deleted: <code>{name}</code>\n"
-            f"Chat: {update.effective_chat.title or update.effective_chat.id} (<code>{update.effective_chat.id}</code>)\n"
+            f"Chat: {chat_id}\n"
             f"By: {update.effective_user.mention_html()}",
         )
     else:
         await update.effective_message.reply_text(f"No filter named '{name}' found.")
 
 
+FILTERS_PER_PAGE = 10
+
+
+def _build_filters_page(filters_list, chat_id: int, page: int):
+    """Builds the text + pagination keyboard for one page of an (already
+    A-Z sorted) filter list, one filter name per line."""
+    total = len(filters_list)
+    total_pages = max(1, (total + FILTERS_PER_PAGE - 1) // FILTERS_PER_PAGE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * FILTERS_PER_PAGE
+    chunk = filters_list[start:start + FILTERS_PER_PAGE]
+
+    lines = "\n".join(f"{start + i + 1}. `{f['name']}`" for i, f in enumerate(chunk))
+    text = f"📋 *Filters ({total}):*\n{lines}\n\nPage {page}/{total_pages}"
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"filterspage:{chat_id}:{page - 1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"filterspage:{chat_id}:{page + 1}"))
+    markup = InlineKeyboardMarkup([nav_row]) if nav_row else None
+
+    return text, markup
+
+
 async def list_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filters_list = await list_filters(update.effective_chat.id)
-    if not filters_list:
-        await update.effective_message.reply_text("No filters saved in this chat yet.")
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await update.effective_message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
         return
-    names = ", ".join(f"`{f['name']}`" for f in filters_list)
-    await update.effective_message.reply_text(
-        f"📋 *Filters in this chat ({len(filters_list)}):*\n{names}", parse_mode="Markdown"
-    )
+    filters_list = await list_filters(chat_id)  # already sorted A-Z by db query
+    if not filters_list:
+        await update.effective_message.reply_text("No filters saved in that chat yet.")
+        return
+    text, markup = _build_filters_page(filters_list, chat_id, page=1)
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def filters_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, chat_id_str, page_str = query.data.split(":")
+        chat_id, page = int(chat_id_str), int(page_str)
+    except (ValueError, AttributeError):
+        return
+    filters_list = await list_filters(chat_id)
+    if not filters_list:
+        await query.edit_message_text("No filters saved in that chat anymore.")
+        return
+    text, markup = _build_filters_page(filters_list, chat_id, page)
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
 async def delete_all_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
-    count = await delete_all_filters(update.effective_chat.id)
-    await update.effective_message.reply_text(f"🗑 Deleted {count} filter(s) from this chat.")
+    count = await delete_all_filters(chat_id)
+    await update.effective_message.reply_text(f"🗑 Deleted {count} filter(s).")
 
 
 async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, doc: dict):
@@ -637,14 +732,15 @@ async def filter_trigger_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ============================================================
 
 async def autodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
-        return
     args = context.args
     if not args or args[0].lower() not in ("on", "off"):
         await update.effective_message.reply_text("Usage: /autodel on <seconds>  |  /autodel off")
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
+        return
+
     if args[0].lower() == "off":
         await update_settings(chat_id, autodel_on=False)
         await update.effective_message.reply_text("🗑 Auto-delete disabled.")
@@ -660,7 +756,13 @@ async def autodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def top_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await update.effective_message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
+        return
     top = await top_filters(chat_id, limit=10)
     if not top:
         await update.effective_message.reply_text("No filters have been used yet.")
@@ -674,12 +776,12 @@ async def top_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def fclone_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
-    chat_id = update.effective_chat.id
     enabled = context.args[0].lower() == "on"
     await update_settings(chat_id, fclone_on=enabled)
-    await update.effective_message.reply_text(f"🔄 Filter cloning {'enabled' if enabled else 'disabled'} for this chat.")
+    await update.effective_message.reply_text(f"🔄 Filter cloning {'enabled' if enabled else 'disabled'} for that chat.")
 
 
 async def fclone_copy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -724,21 +826,22 @@ async def fclone_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def suggestmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
-        return
     args = context.args
     if not args or args[0].lower() not in ("on", "off"):
         await update.effective_message.reply_text("Usage: /suggestmode on|off")
         return
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
+        return
     enabled = args[0].lower() == "on"
-    await update_settings(update.effective_chat.id, suggestmode_on=enabled)
+    await update_settings(chat_id, suggestmode_on=enabled)
     await update.effective_message.reply_text(f"🎲 Suggest mode {'enabled' if enabled else 'disabled'}.")
 
 
 async def syncgenre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
-    chat_id = update.effective_chat.id
     missing = await all_filters_missing_genre(chat_id)
     updated = 0
     for f in missing:
@@ -781,9 +884,9 @@ async def smart_suggest_handler(update: Update, context: ContextTypes.DEFAULT_TY
 # ============================================================
 
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
-    chat_id = update.effective_chat.id
     filters_list = await list_filters(chat_id)
     if not filters_list:
         await update.effective_message.reply_text("No filters to export.")
@@ -805,11 +908,13 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update, context):
-        return
     message = update.effective_message
     if not message.reply_to_message or not message.reply_to_message.document:
         await message.reply_text("Reply to a previously exported .json file with /import to restore its filters.")
+        return
+
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
         return
 
     doc = message.reply_to_message.document
@@ -825,7 +930,6 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ Couldn't parse that file as valid filter JSON.")
         return
 
-    chat_id = update.effective_chat.id
     count = 0
     for entry in data:
         if "name" not in entry:
@@ -1002,6 +1106,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("info", info_cmd))
     app.add_handler(CommandHandler("donate", donate_cmd))
     app.add_handler(CallbackQueryHandler(help_center_callback, pattern="^help_center$"))
+    app.add_handler(CallbackQueryHandler(filters_page_callback, pattern="^filterspage:"))
 
     app.add_handler(CommandHandler("add", add_filter_cmd))
     app.add_handler(CommandHandler("del", del_filter_cmd))
