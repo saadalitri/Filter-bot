@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 #  works unchanged if you later deploy somewhere that injects them)
 # ============================================================
 
-BOT_TOKEN = "8838446349:AAG_Dv0xt7mi7UTnqxLcTY21y54TLPBOweQ"
+BOT_TOKEN = "8735710065:AAHcrfnLjSkHVBrTQG0_22B2bQjc-eahlqk"
 MONGO_URI = "mongodb+srv://echoharmonic21_db_user:echoharmonic21_db_user@cluster0.tsbqkq0.mongodb.net/?appName=Cluster0"
 DB_NAME = "echoharmonic21_db_user"
 SUDO_USERS = [8536019525]
@@ -974,6 +974,18 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
+
+    # Python 3.12+ (and especially 3.14) removed the old behaviour where
+    # asyncio.get_event_loop() would silently create a loop if none existed
+    # in the main thread. python-telegram-bot 21.4 still relies on that old
+    # behaviour internally, which crashes with:
+    #   RuntimeError: There is no current event loop in thread 'MainThread'
+    # Explicitly creating and setting a loop here works around it regardless
+    # of which Python version Render happens to be using.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     if WEBHOOK_URL:
         # Web Service mode: Render requires binding to $PORT.
