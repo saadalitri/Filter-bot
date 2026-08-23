@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 #  works unchanged if you later deploy somewhere that injects them)
 # ============================================================
 
-BOT_TOKEN = "8838446349:AAG_Dv0xt7mi7UTnqxLcTY21y54TLPBOweQ"
+BOT_TOKEN = "8838446349:AAEhJRJ8-KSG209UwnG6L8y0DZflyJczVq4"
 MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster0"
 DB_NAME = "Alizenx"
 SUDO_USERS = [8536019525]
