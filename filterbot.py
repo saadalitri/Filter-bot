@@ -114,7 +114,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # ---- Branding / /start command customization -- EDIT THESE DIRECTLY ----
 START_IMAGE_URL = "https://graph.org/file/2e4f101c19180e2666a0d-6c52f607935c1f2f71.mp4"
-BOT_NAME = "Telegram Assist Bot"
+BOT_NAME = "Filter Assist Bot"
 OWNER_URL = "https://t.me/Zenx_Era"
 UPDATES_URL = "https://t.me/Eric_Vanitas"
 SUPPORT_TEXT = (
@@ -122,7 +122,7 @@ SUPPORT_TEXT = (
 )
 # Just the bot's @username, WITHOUT the leading "@" (fixed — the original had
 # "@Filter_Assistbot" which broke the "Add me to your group" link).
-BOT_USERNAME_FOR_ADD = "@Filter_Assistbot"
+BOT_USERNAME_FOR_ADD = "Filter_Assistbot"
 
 GENRES = {"action", "romance", "comedy", "horror", "drama", "thriller", "sci-fi", "animation"}
 RANDOM_KEYWORDS = {"suggest", "best", "random", "recommend", "surprise me"}
