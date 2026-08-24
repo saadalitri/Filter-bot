@@ -401,12 +401,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if START_IMAGE_URL:
         try:
-            await update.effective_message.reply_photo(
-                photo=START_IMAGE_URL, caption=caption, parse_mode="HTML", reply_markup=_home_keyboard()
+            await update.effective_message.reply_video(
+                video=START_IMAGE_URL, caption=caption, parse_mode="HTML", reply_markup=_home_keyboard()
             )
             return
         except Exception:
-            # Falls back to text-only if the image URL is unreachable/misconfigured.
+            # Falls back to text-only if the video URL is unreachable/misconfigured.
             pass
     await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=_home_keyboard())
 
@@ -775,10 +775,36 @@ async def filter_trigger_handler(update: Update, context: ContextTypes.DEFAULT_T
     message = update.effective_message
     if not message or not message.text:
         return
+
+    # In a group this is just the current chat. In a DM it's whichever
+    # group the user connected via /connect -- without this, filters typed
+    # in DM were being looked up against the DM's own (empty) filter list.
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        return
+
     text = message.text.lower().strip()
-    doc = await get_filter(update.effective_chat.id, text)
+
+    # Exact match first (cheap, and preserves old behaviour for filters
+    # whose name IS the whole message).
+    doc = await get_filter(chat_id, text)
     if doc:
         await send_filter_reply(update, context, doc)
+        return
+
+    # Otherwise check whether any filter name appears anywhere inside the
+    # message -- e.g. filter "beyond goodbye" should still fire on
+    # "beyond goodbye hindi dubbed". Matched as a whole phrase (word
+    # boundaries) so a filter like "hi" doesn't fire on "history".
+    all_filters = await list_filters(chat_id)
+    for f in all_filters:
+        name = f["name"]
+        if not name:
+            continue
+        pattern = r"(?<!\w)" + re.escape(name) + r"(?!\w)"
+        if re.search(pattern, text):
+            await send_filter_reply(update, context, f)
+            return
 
 
 # ============================================================
