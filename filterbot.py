@@ -54,10 +54,10 @@ Commands:
     Core:        /add, /del, /filters, /deleteallfilters
     Auto mgmt:   /autodel on <sec> | off, /topfilters
     Cloning:     /fclone on|off, /fclone <source_id> <target_id>
-    Smart:       /suggestmode on|off, genre keywords, random-pick keywords, /syncgenre
     Buttons:     [Text](buttonurl:https://link) inside any /add reply text
     Backup:      /export, /import (reply to the exported .json)
     Connections: /connect <group_id>, /connections, /disconnect
+    Broadcast:   /broadcast <message> (sudo only, sends to every known chat)
 
 Add the bot to a group and promote it to admin (needed for /autodel message
 deletion and for reading the member list to check who's an admin).
@@ -67,7 +67,6 @@ import os
 import re
 import json
 import io
-import random
 import asyncio
 import logging
 import shlex
@@ -114,7 +113,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # ---- Branding / /start command customization -- EDIT THESE DIRECTLY ----
 START_IMAGE_URL = "https://graph.org/file/2e4f101c19180e2666a0d-6c52f607935c1f2f71.mp4"
-BOT_NAME = "Filter Assist Bot"
+BOT_NAME = "Telegram Assist Bot"
 OWNER_URL = "https://t.me/Zenx_Era"
 UPDATES_URL = "https://t.me/Eric_Vanitas"
 SUPPORT_TEXT = (
@@ -124,15 +123,12 @@ SUPPORT_TEXT = (
 # "@Filter_Assistbot" which broke the "Add me to your group" link).
 BOT_USERNAME_FOR_ADD = "Filter_Assistbot"
 
-GENRES = {"action", "romance", "comedy", "horror", "drama", "thriller", "sci-fi", "animation"}
-RANDOM_KEYWORDS = {"suggest", "best", "random", "recommend", "surprise me"}
 FILE_TYPES = ("photo", "video", "document", "animation", "sticker", "audio", "voice")
 
 DEFAULT_SETTINGS = {
     "autodel_on": False,
     "autodel_sec": 60,
     "fclone_on": False,
-    "suggestmode_on": False,
 }
 
 # ============================================================
@@ -209,20 +205,6 @@ async def top_filters(chat_id: int, limit: int = 10):
 
 async def increment_uses(chat_id: int, name: str):
     await filters_col.update_one({"chat_id": chat_id, "name": name.lower().strip()}, {"$inc": {"uses": 1}})
-
-
-async def filters_by_genre(chat_id: int, genre: str):
-    cursor = filters_col.find({"chat_id": chat_id, "genre": genre.lower().strip()})
-    return [doc async for doc in cursor]
-
-
-async def all_filters_missing_genre(chat_id: int):
-    cursor = filters_col.find({"chat_id": chat_id, "genre": None})
-    return [doc async for doc in cursor]
-
-
-async def set_genre(chat_id: int, name: str, genre: str):
-    await filters_col.update_one({"chat_id": chat_id, "name": name.lower().strip()}, {"$set": {"genre": genre}})
 
 
 async def clone_filters(source_id: int, target_id: int) -> int:
@@ -335,6 +317,16 @@ async def resolve_target_chat_id(update: Update, context: ContextTypes.DEFAULT_T
     return await get_connection(update.effective_user.id)
 
 
+async def get_chat_label(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    """Best-effort human-readable name for a chat_id, for showing the admin
+    which connected group a DM command is actually operating on."""
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        return chat.title or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
 async def require_admin_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resolves the target chat (see resolve_target_chat_id) AND verifies the
     calling user is an admin there. Returns the chat_id to operate on, or
@@ -437,11 +429,6 @@ HELP_TEXT = (
     "🔄 <b>Cloning</b>\n"
     "• /fclone <code>on|off</code>\n"
     "• /fclone <code>source_id target_id</code>\n\n"
-    "🎲 <b>Smart</b>\n"
-    "• /suggestmode <code>on|off</code>\n"
-    "• Type a genre (action, romance, comedy...) for matches\n"
-    "• Type suggest/best/random for a random pick\n"
-    "• /syncgenre — tag old filters\n\n"
     "📥 <b>Backup</b>\n"
     "• /export — save filters as .json\n"
     "• /import — reply to a backup file to restore\n\n"
@@ -452,7 +439,10 @@ HELP_TEXT = (
     "ℹ️ <b>Utility</b>\n"
     "• /id — get your/this chat's ID (reply to get someone else's)\n"
     "• /info — get info about yourself (reply to get someone else's)\n"
-    "• /donate — support the bot"
+    "• /donate — support the bot\n\n"
+    "📢 <b>Owner only</b>\n"
+    "• /broadcast <code>message</code> — send to every chat the bot is in "
+    "(or reply to a message with /broadcast)"
 )
 
 
@@ -561,12 +551,21 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         chat_label = chat_id
     await message.reply_text(f"✅ Filter '{name}' saved" + (f" in '{chat_label}'." if update.effective_chat.type == "private" else "."))
-    await send_log(
-        context,
-        f"➕ Filter added: <code>{name}</code>\n"
-        f"Chat: {chat_label} (<code>{chat_id}</code>)\n"
-        f"By: {update.effective_user.mention_html()}",
+
+    # Log the FULL filter (text, buttons, and the actual media itself if any)
+    # to the log channel -- not just the name -- so the log is a complete
+    # record of what every filter actually does.
+    await log_filter_details(
+        context, event="➕ Filter added", name=name, chat_label=chat_label, chat_id=chat_id,
+        by_html=update.effective_user.mention_html(), reply_text=clean_text,
+        buttons=all_buttons, file_id=file_id, file_type=file_type,
     )
+
+    # Show the admin exactly what this filter will look like when it fires,
+    # right here in the chat where /add was run (DM or group) -- without
+    # touching usage stats or triggering auto-delete.
+    await message.reply_text("👀 Preview:")
+    await _send_rendered_filter(context, update.effective_chat.id, clean_text, all_buttons, file_id, file_type)
 
 
 async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,7 +604,7 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 FILTERS_PER_PAGE = 10
 
 
-def _build_filters_page(filters_list, chat_id: int, page: int):
+def _build_filters_page(filters_list, chat_id: int, page: int, chat_label: str = None):
     """Builds the text + pagination keyboard for one page of an (already
     A-Z sorted) filter list, one filter name per line."""
     total = len(filters_list)
@@ -615,7 +614,8 @@ def _build_filters_page(filters_list, chat_id: int, page: int):
     chunk = filters_list[start:start + FILTERS_PER_PAGE]
 
     lines = "\n".join(f"{start + i + 1}. `{f['name']}`" for i, f in enumerate(chunk))
-    text = f"📋 *Filters ({total}):*\n{lines}\n\nPage {page}/{total_pages}"
+    header = f"📋 *Filters for '{chat_label}'* ({total}):" if chat_label else f"📋 *Filters ({total}):*"
+    text = f"{header}\n{lines}\n\nPage {page}/{total_pages}"
 
     nav_row = []
     if page > 1:
@@ -639,7 +639,10 @@ async def list_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not filters_list:
         await update.effective_message.reply_text("No filters saved in that chat yet.")
         return
-    text, markup = _build_filters_page(filters_list, chat_id, page=1)
+    # Showing the connected group's name matters most in DM, where it's the
+    # only way to tell which group these filters actually belong to.
+    chat_label = await get_chat_label(context, chat_id) if update.effective_chat.type == "private" else None
+    text, markup = _build_filters_page(filters_list, chat_id, page=1, chat_label=chat_label)
     await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
@@ -655,7 +658,8 @@ async def filters_page_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not filters_list:
         await query.edit_message_text("No filters saved in that chat anymore.")
         return
-    text, markup = _build_filters_page(filters_list, chat_id, page)
+    chat_label = await get_chat_label(context, chat_id) if update.effective_chat.type == "private" else None
+    text, markup = _build_filters_page(filters_list, chat_id, page, chat_label=chat_label)
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
@@ -667,40 +671,90 @@ async def delete_all_filters_cmd(update: Update, context: ContextTypes.DEFAULT_T
     await update.effective_message.reply_text(f"🗑 Deleted {count} filter(s).")
 
 
-async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, doc: dict):
-    chat_id = update.effective_chat.id
-    markup = build_markup(doc.get("buttons"))
-    sent_msg = None
-    trigger_id = update.effective_message.message_id if update.effective_message else None
+async def _send_rendered_filter(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reply_text: str,
+                                 buttons, file_id: str = None, file_type: str = None, reply_to: int = None):
+    """Actually sends a filter's content (text/media/buttons) to chat_id.
+    Shared by the live trigger path (send_filter_reply) and the /add preview,
+    so both always render identically."""
+    markup = build_markup(buttons)
+    if file_id:
+        if file_type == "sticker":
+            return await context.bot.send_sticker(chat_id, file_id, reply_to_message_id=reply_to)
+        send_map = {
+            "photo": context.bot.send_photo, "video": context.bot.send_video,
+            "document": context.bot.send_document, "animation": context.bot.send_animation,
+            "audio": context.bot.send_audio, "voice": context.bot.send_voice,
+        }
+        sender = send_map[file_type]
+        return await sender(
+            chat_id=chat_id, **{file_type: file_id},
+            caption=reply_text or None, reply_markup=markup,
+            reply_to_message_id=reply_to,
+        )
+    return await context.bot.send_message(
+        chat_id=chat_id, text=reply_text or "‎", reply_markup=markup,
+        reply_to_message_id=reply_to,
+    )
 
-    async def _send(reply_to):
-        if doc.get("file_id"):
-            if doc["file_type"] == "sticker":
-                return await context.bot.send_sticker(chat_id, doc["file_id"], reply_to_message_id=reply_to)
+
+async def log_filter_details(context: ContextTypes.DEFAULT_TYPE, event: str, name: str, chat_label,
+                              chat_id: int, by_html: str, reply_text: str, buttons, file_id: str = None,
+                              file_type: str = None):
+    """Logs a FULL record of a filter to the log channel: not just its name,
+    but its actual text, its buttons (label -> url), and the real media
+    itself (photo/video/sticker/etc.) so the log channel is a complete
+    audit trail of every filter's content -- not just that something happened."""
+    if not LOG_CHANNEL_ID:
+        return
+
+    lines = [f"{event}: <code>{name}</code>", f"Chat: {chat_label} (<code>{chat_id}</code>)", f"By: {by_html}"]
+    if file_type:
+        lines.append(f"Type: {file_type}")
+    if reply_text:
+        safe_text = reply_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f"Text: {safe_text}")
+    if buttons:
+        for row in buttons:
+            lines.append("Button(s): " + " | ".join(f"{label} → {url}" for label, url in row))
+    summary = "\n".join(lines)
+
+    try:
+        if file_id and file_type != "sticker":
             send_map = {
                 "photo": context.bot.send_photo, "video": context.bot.send_video,
                 "document": context.bot.send_document, "animation": context.bot.send_animation,
                 "audio": context.bot.send_audio, "voice": context.bot.send_voice,
             }
-            sender = send_map[doc["file_type"]]
-            return await sender(
-                chat_id=chat_id, **{doc["file_type"]: doc["file_id"]},
-                caption=doc.get("reply_text") or None, reply_markup=markup,
-                reply_to_message_id=reply_to,
-            )
-        return await context.bot.send_message(
-            chat_id=chat_id, text=doc.get("reply_text") or "‎", reply_markup=markup,
-            reply_to_message_id=reply_to,
-        )
+            sender = send_map.get(file_type)
+            if sender:
+                await sender(chat_id=LOG_CHANNEL_ID, **{file_type: file_id}, caption=summary[:1024], parse_mode="HTML")
+                return
+        elif file_id and file_type == "sticker":
+            await context.bot.send_sticker(LOG_CHANNEL_ID, file_id)
+        await context.bot.send_message(LOG_CHANNEL_ID, summary, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning(f"Failed to log filter details: {e}")
+
+
+async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, doc: dict):
+    chat_id = update.effective_chat.id
+    sent_msg = None
+    trigger_id = update.effective_message.message_id if update.effective_message else None
 
     try:
         # Reply/quote the message that triggered the filter, like Rose-bot does.
-        sent_msg = await _send(trigger_id)
+        sent_msg = await _send_rendered_filter(
+            context, chat_id, doc.get("reply_text"), doc.get("buttons"),
+            doc.get("file_id"), doc.get("file_type"), reply_to=trigger_id,
+        )
     except Exception:
         # The triggering message may have been deleted, or replies may be
         # restricted in this chat -- fall back to a plain (non-reply) send
         # instead of failing silently.
-        sent_msg = await _send(None)
+        sent_msg = await _send_rendered_filter(
+            context, chat_id, doc.get("reply_text"), doc.get("buttons"),
+            doc.get("file_id"), doc.get("file_type"), reply_to=None,
+        )
 
     await increment_uses(chat_id, doc["name"])
 
@@ -822,64 +876,6 @@ async def fclone_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Smart features: suggest mode, genre matching, syncgenre
-# ============================================================
-
-async def suggestmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args or args[0].lower() not in ("on", "off"):
-        await update.effective_message.reply_text("Usage: /suggestmode on|off")
-        return
-    chat_id = await require_admin_for_chat(update, context)
-    if chat_id is None:
-        return
-    enabled = args[0].lower() == "on"
-    await update_settings(chat_id, suggestmode_on=enabled)
-    await update.effective_message.reply_text(f"🎲 Suggest mode {'enabled' if enabled else 'disabled'}.")
-
-
-async def syncgenre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = await require_admin_for_chat(update, context)
-    if chat_id is None:
-        return
-    missing = await all_filters_missing_genre(chat_id)
-    updated = 0
-    for f in missing:
-        haystack = f"{f['name']} {f.get('reply_text', '')}".lower()
-        for genre in GENRES:
-            if genre in haystack:
-                await set_genre(chat_id, f["name"], genre)
-                updated += 1
-                break
-    await update.effective_message.reply_text(f"🔄 Sync complete. Tagged {updated} of {len(missing)} un-tagged filter(s).")
-
-
-async def smart_suggest_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    chat_id = update.effective_chat.id
-    settings = await get_settings(chat_id)
-    if not settings.get("suggestmode_on"):
-        return
-
-    text = message.text.lower().strip()
-
-    matched_genre = next((g for g in GENRES if g in text.split()), None)
-    if matched_genre:
-        candidates = await filters_by_genre(chat_id, matched_genre)
-        if candidates:
-            await send_filter_reply(update, context, random.choice(candidates))
-        return
-
-    if any(word in text for word in RANDOM_KEYWORDS):
-        all_f = await list_filters(chat_id)
-        if all_f:
-            await send_filter_reply(update, context, random.choice(all_f))
-
-
-# ============================================================
 # Backup / restore
 # ============================================================
 
@@ -976,12 +972,13 @@ async def connections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not group_id:
         await update.effective_message.reply_text("You have no active connection. Use /connect <group_id>.")
         return
-    try:
-        chat = await context.bot.get_chat(group_id)
-        title = chat.title
-    except Exception:
-        title = str(group_id)
-    await update.effective_message.reply_text(f"🔗 Currently connected to: {title} (`{group_id}`)", parse_mode="Markdown")
+    title = await get_chat_label(context, group_id)
+    filter_count = len(await list_filters(group_id))
+    await update.effective_message.reply_text(
+        f"🔗 Currently connected to: *{title}* (`{group_id}`)\n"
+        f"📋 {filter_count} filter(s) saved there.",
+        parse_mode="Markdown",
+    )
 
 
 async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -991,6 +988,57 @@ async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("🔌 Disconnected.")
     else:
         await update.effective_message.reply_text("You weren't connected to anything.")
+
+
+# ============================================================
+# Broadcast (owner-only)
+# ============================================================
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in SUDO_USERS:
+        await update.effective_message.reply_text("⚠️ Only the bot owner can use /broadcast.")
+        return
+
+    message = update.effective_message
+    source = message.reply_to_message
+
+    text = None
+    if not source:
+        raw = message.text or ""
+        parts = raw.split(None, 1)
+        text = parts[1] if len(parts) > 1 else ""
+        if not text:
+            await message.reply_text(
+                "Usage: /broadcast <message>\nOr reply to any message (text, photo, video, etc.) with /broadcast."
+            )
+            return
+
+    # Union of every chat_id we have any record of: chats_col (settings doc,
+    # created the first time any filter command runs there) plus filters_col
+    # (in case filters were added but that chat never triggered a settings
+    # write) -- so a brand-new group isn't missed just because no one has
+    # typed a filter keyword there yet.
+    settings_ids = {doc["chat_id"] async for doc in chats_col.find({}, {"chat_id": 1})}
+    filter_ids = set(await filters_col.distinct("chat_id"))
+    chat_ids = settings_ids | filter_ids
+    if not chat_ids:
+        await message.reply_text("No known chats to broadcast to yet.")
+        return
+
+    status = await message.reply_text(f"📢 Broadcasting to {len(chat_ids)} chat(s)...")
+    sent, failed = 0, 0
+    for cid in chat_ids:
+        try:
+            if source:
+                await context.bot.copy_message(chat_id=cid, from_chat_id=source.chat_id, message_id=source.message_id)
+            else:
+                await context.bot.send_message(cid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # gentle throttle to stay under Telegram's flood limits
+
+    await status.edit_text(f"📢 Broadcast complete: {sent} sent, {failed} failed (bot removed/blocked there, most likely).")
 
 
 # ============================================================
@@ -1076,13 +1124,12 @@ async def post_init(application: Application):
             BotCommand("autodel", "Auto-delete replies"),
             BotCommand("topfilters", "View most-used filters"),
             BotCommand("fclone", "Enable/copy filter cloning"),
-            BotCommand("suggestmode", "Toggle random suggestions"),
-            BotCommand("syncgenre", "Tag old filters with a genre"),
             BotCommand("export", "Export filters as .json"),
             BotCommand("import", "Import filters from backup"),
             BotCommand("connect", "Connect your group"),
             BotCommand("connections", "Manage linked groups"),
             BotCommand("disconnect", "Disconnect your group"),
+            BotCommand("broadcast", "Owner: message every chat"),
             BotCommand("id", "Get user/group ID"),
             BotCommand("info", "Get user info"),
             BotCommand("donate", "Support the bot"),
@@ -1118,18 +1165,15 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("fclone", fclone_dispatch))
 
-    app.add_handler(CommandHandler("suggestmode", suggestmode_cmd))
-    app.add_handler(CommandHandler("syncgenre", syncgenre_cmd))
-
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("import", import_cmd))
 
     app.add_handler(CommandHandler("connect", connect_cmd))
     app.add_handler(CommandHandler("connections", connections_cmd))
     app.add_handler(CommandHandler("disconnect", disconnect_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
     app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, filter_trigger_handler), group=0)
-    app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, smart_suggest_handler), group=1)
 
     # Logging: new members joining, and the bot itself being added to a group.
     app.add_handler(MessageHandler(tg_filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_member_cmd))
