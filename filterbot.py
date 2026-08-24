@@ -55,7 +55,7 @@ Commands:
     Auto mgmt:   /autodel on <sec> | off, /topfilters
     Cloning:     /fclone on|off, /fclone <source_id> <target_id>
     Buttons:     [Text](buttonurl:https://link) inside any /add reply text
-    Backup:      /export, /import (reply to the exported .json)
+    Backup:      /export, /import (reply to the exported .json), /massexport (owner, all chats)
     Connections: /connect <group_id>, /connections, /disconnect
     Broadcast:   /broadcast <message> (sudo only, sends to every known chat)
 
@@ -67,6 +67,7 @@ import os
 import re
 import json
 import io
+import zipfile
 import asyncio
 import logging
 import shlex
@@ -74,7 +75,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MessageEntity
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters as tg_filters, ContextTypes,
@@ -169,12 +170,13 @@ async def ensure_indexes():
 
 
 async def add_filter(chat_id: int, name: str, reply_text: str, buttons=None,
-                      file_id: str = None, file_type: str = None, genre: str = None):
+                      file_id: str = None, file_type: str = None, genre: str = None,
+                      entities: list = None):
     name = name.lower().strip()
     doc = {
         "chat_id": chat_id, "name": name, "reply_text": reply_text,
         "buttons": buttons or [], "file_id": file_id, "file_type": file_type,
-        "genre": genre, "uses": 0,
+        "genre": genre, "entities": entities or [], "uses": 0,
     }
     await filters_col.update_one({"chat_id": chat_id, "name": name}, {"$set": doc}, upsert=True)
 
@@ -212,7 +214,8 @@ async def clone_filters(source_id: int, target_id: int) -> int:
     count = 0
     for f in src_filters:
         await add_filter(target_id, f["name"], f["reply_text"], f.get("buttons"),
-                          f.get("file_id"), f.get("file_type"), f.get("genre"))
+                          f.get("file_id"), f.get("file_type"), f.get("genre"),
+                          entities=f.get("entities"))
         count += 1
     return count
 
@@ -250,6 +253,93 @@ async def remove_connection(user_id: int) -> bool:
 BUTTON_REGEX = re.compile(r"\[([^\[\]]+)\]\(buttonurl:(?://)?(.+?)\)", re.IGNORECASE)
 
 
+def _utf16_len(s: str) -> int:
+    """Telegram entity offsets/lengths are counted in UTF-16 code units,
+    not Python characters -- they differ for any character outside the
+    Basic Multilingual Plane (most emoji, e.g. 👇). This converts a Python
+    substring length into the equivalent Telegram offset units."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _entities_to_dicts(entities, offset_shift: int = 0):
+    if not entities:
+        return []
+    out = []
+    for e in entities:
+        d = {"type": e.type, "offset": e.offset - offset_shift, "length": e.length}
+        if e.url:
+            d["url"] = e.url
+        if getattr(e, "language", None):
+            d["language"] = e.language
+        out.append(d)
+    return out
+
+
+def _dicts_to_entities(dicts):
+    if not dicts:
+        return None
+    return [
+        MessageEntity(type=d["type"], offset=d["offset"], length=d["length"],
+                      url=d.get("url"), language=d.get("language"))
+        for d in dicts
+    ]
+
+
+def _parse_name_from_rest(rest: str):
+    """Pulls out just the first argument (the filter name) from the raw
+    command text -- supporting a quoted multi-word name -- WITHOUT
+    touching anything after it, so every space/newline the admin typed in
+    the actual reply body survives untouched (unlike the old shlex.split()
+    + ' '.join() approach, which collapsed all whitespace/newlines into
+    single spaces). Returns (name, char_index_in_rest_where_body_starts)."""
+    lead = len(rest) - len(rest.lstrip())
+    i = lead
+    if i >= len(rest):
+        return "", len(rest)
+    if rest[i] in ("'", '"'):
+        quote = rest[i]
+        end = rest.find(quote, i + 1)
+        if end == -1:
+            m = re.match(r"\S*", rest[i:])
+            name = m.group(0)
+            body_start = i + len(name)
+        else:
+            name = rest[i + 1:end]
+            body_start = end + 1
+    else:
+        m = re.match(r"\S+", rest[i:])
+        name = m.group(0) if m else ""
+        body_start = i + len(name)
+    if body_start < len(rest) and rest[body_start] == " ":
+        body_start += 1
+    return name, body_start
+
+
+def parse_command_name_and_body(message):
+    """Splits a /add-style command into (name, body_text, body_entities)
+    while preserving the body's exact whitespace/newlines and any real
+    Telegram formatting (bold/italic/code/links/etc.) the admin used,
+    instead of flattening everything to plain space-joined text."""
+    raw = message.text or message.caption or ""
+    entities = list(message.entities or message.caption_entities or [])
+
+    cmd_match = re.match(r"^\S+\s*", raw)
+    cmd_len_char = cmd_match.end() if cmd_match else 0
+    rest = raw[cmd_len_char:]
+
+    name, body_start_in_rest = _parse_name_from_rest(rest)
+    body_start_char = cmd_len_char + body_start_in_rest
+    body_text = raw[body_start_char:]
+
+    body_start_units = _utf16_len(raw[:body_start_char])
+    body_entities = [
+        {"type": e.type, "offset": e.offset - body_start_units, "length": e.length,
+         **({"url": e.url} if e.url else {})}
+        for e in entities if e.offset >= body_start_units
+    ]
+    return name.lower(), body_text, body_entities
+
+
 def parse_buttons(text: str):
     """Extracts [Label](buttonurl:...) tags and groups them into rows.
     Two buttons written on the SAME line (no newline between them) end up
@@ -270,6 +360,46 @@ def parse_buttons(text: str):
         last_end = match.end()
     clean_text = BUTTON_REGEX.sub("", text).strip()
     return clean_text, rows
+
+
+def parse_buttons_with_entities(text: str, entity_dicts: list):
+    """Same as parse_buttons, but also keeps a list of formatting entities
+    (bold/italic/etc, as plain dicts) in sync: entities that overlap a
+    removed [Label](buttonurl:...) tag are dropped (buttons shouldn't
+    normally sit inside styled text), and everything else has its offset
+    shifted left by however much text was removed before it -- so bold,
+    italics, links etc. on the surrounding text still land in the right
+    place after the button tags are stripped out."""
+    clean_text, rows = parse_buttons(text)
+    if not entity_dicts:
+        return clean_text, rows, []
+
+    pre_strip = BUTTON_REGEX.sub("", text)
+    lead_trim_units = _utf16_len(pre_strip[:len(pre_strip) - len(pre_strip.lstrip())])
+
+    removals_units = []
+    for match in BUTTON_REGEX.finditer(text):
+        removals_units.append((_utf16_len(text[:match.start()]), _utf16_len(text[:match.end()])))
+
+    def overlaps_any(start_u, end_u):
+        return any(not (end_u <= us or start_u >= ue) for us, ue in removals_units)
+
+    def shift(pos_units):
+        removed_before = sum(ue - us for us, ue in removals_units if ue <= pos_units)
+        return pos_units - removed_before - lead_trim_units
+
+    new_entities = []
+    for e in entity_dicts:
+        e_start, e_end = e["offset"], e["offset"] + e["length"]
+        if overlaps_any(e_start, e_end):
+            continue
+        new_e = dict(e)
+        new_e["offset"] = shift(e_start)
+        if new_e["offset"] < 0:
+            continue
+        new_entities.append(new_e)
+
+    return clean_text, rows, new_entities
 
 
 def build_markup(buttons):
@@ -431,7 +561,8 @@ HELP_TEXT = (
     "• /fclone <code>source_id target_id</code>\n\n"
     "📥 <b>Backup</b>\n"
     "• /export — save filters as .json\n"
-    "• /import — reply to a backup file to restore\n\n"
+    "• /import — reply to a backup file to restore\n"
+    "• /massexport — owner only: export every chat's filters at once (zipped)\n\n"
     "🔗 <b>Connections</b>\n"
     "• /connect <code>group_id</code>\n"
     "• /connections\n"
@@ -487,17 +618,13 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
 
     # Parse the raw command text ourselves (instead of context.args) so that
-    # quoted names work: /add "the era" some long reply text here...
-    raw = message.text or message.caption or ""
-    parts = raw.split(None, 1)
-    rest = parts[1] if len(parts) > 1 else ""
-    try:
-        tokens = shlex.split(rest)
-    except ValueError:
-        # Unbalanced quotes -- fall back to naive whitespace splitting.
-        tokens = rest.split()
+    # quoted names work, AND so the reply body keeps every space/newline the
+    # admin actually typed, plus any real bold/italic/link formatting --
+    # none of that is preserved by shlex.split()+' '.join(), which collapses
+    # all whitespace to single spaces and throws formatting entities away.
+    name, reply_text, entity_dicts = parse_command_name_and_body(message)
 
-    if not tokens:
+    if not name:
         await message.reply_text(
             "Usage: /add <name> <reply text>\n"
             "For a multi-word name, wrap it in quotes: /add \"the era\" <reply text>\n"
@@ -505,9 +632,6 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "to save that media, and add buttons with [Text](buttonurl:https://link)."
         )
         return
-
-    name = tokens[0].lower()
-    reply_text = " ".join(tokens[1:]).strip()
 
     file_id, file_type = None, None
     original_buttons = []
@@ -521,8 +645,10 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         if not reply_text and replied.caption:
             reply_text = replied.caption
+            entity_dicts = _entities_to_dicts(replied.caption_entities)
         if not reply_text and replied.text:
             reply_text = replied.text
+            entity_dicts = _entities_to_dicts(replied.entities)
 
         # Preserve any URL buttons already attached to the replied message,
         # so filters keep working links (e.g. Tutorial / Watch / Download).
@@ -538,12 +664,16 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ Provide reply text, or reply to a message/media to save.")
         return
 
-    clean_text, parsed_buttons = parse_buttons(reply_text) if reply_text else ("", [])
+    if reply_text:
+        clean_text, parsed_buttons, clean_entities = parse_buttons_with_entities(reply_text, entity_dicts)
+    else:
+        clean_text, parsed_buttons, clean_entities = "", [], []
     all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
 
     await add_filter(
         chat_id=chat_id, name=name, reply_text=clean_text,
         buttons=all_buttons, file_id=file_id, file_type=file_type,
+        entities=clean_entities,
     )
     try:
         target_chat = await context.bot.get_chat(chat_id)
@@ -565,7 +695,7 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # right here in the chat where /add was run (DM or group) -- without
     # touching usage stats or triggering auto-delete.
     await message.reply_text("👀 Preview:")
-    await _send_rendered_filter(context, update.effective_chat.id, clean_text, all_buttons, file_id, file_type)
+    await _send_rendered_filter(context, update.effective_chat.id, clean_text, all_buttons, file_id, file_type, entities=clean_entities)
 
 
 async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,11 +802,15 @@ async def delete_all_filters_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _send_rendered_filter(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reply_text: str,
-                                 buttons, file_id: str = None, file_type: str = None, reply_to: int = None):
+                                 buttons, file_id: str = None, file_type: str = None, reply_to: int = None,
+                                 entities: list = None):
     """Actually sends a filter's content (text/media/buttons) to chat_id.
     Shared by the live trigger path (send_filter_reply) and the /add preview,
-    so both always render identically."""
+    so both always render identically. `entities` (as saved on the filter
+    doc) restores the exact bold/italic/link formatting the admin typed
+    when the filter was created."""
     markup = build_markup(buttons)
+    tg_entities = _dicts_to_entities(entities)
     if file_id:
         if file_type == "sticker":
             return await context.bot.send_sticker(chat_id, file_id, reply_to_message_id=reply_to)
@@ -688,11 +822,11 @@ async def _send_rendered_filter(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         sender = send_map[file_type]
         return await sender(
             chat_id=chat_id, **{file_type: file_id},
-            caption=reply_text or None, reply_markup=markup,
+            caption=reply_text or None, caption_entities=tg_entities, reply_markup=markup,
             reply_to_message_id=reply_to,
         )
     return await context.bot.send_message(
-        chat_id=chat_id, text=reply_text or "‎", reply_markup=markup,
+        chat_id=chat_id, text=reply_text or "‎", entities=tg_entities, reply_markup=markup,
         reply_to_message_id=reply_to,
     )
 
@@ -746,6 +880,7 @@ async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         sent_msg = await _send_rendered_filter(
             context, chat_id, doc.get("reply_text"), doc.get("buttons"),
             doc.get("file_id"), doc.get("file_type"), reply_to=trigger_id,
+            entities=doc.get("entities"),
         )
     except Exception:
         # The triggering message may have been deleted, or replies may be
@@ -754,6 +889,7 @@ async def send_filter_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         sent_msg = await _send_rendered_filter(
             context, chat_id, doc.get("reply_text"), doc.get("buttons"),
             doc.get("file_id"), doc.get("file_type"), reply_to=None,
+            entities=doc.get("entities"),
         )
 
     await increment_uses(chat_id, doc["name"])
@@ -914,18 +1050,63 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No filters to export.")
         return
 
-    export_data = [
-        {
-            "name": f["name"], "reply_text": f.get("reply_text", ""),
-            "buttons": f.get("buttons", []), "file_id": f.get("file_id"),
-            "file_type": f.get("file_type"), "genre": f.get("genre"),
-        }
-        for f in filters_list
-    ]
+    export_data = _filters_to_export_data(filters_list)
     buf = io.BytesIO(json.dumps(export_data, indent=2).encode("utf-8"))
     buf.name = f"filters_{chat_id}.json"
     await update.effective_message.reply_document(
         document=buf, filename=buf.name, caption=f"📥 Exported {len(export_data)} filter(s)."
+    )
+
+
+def _filters_to_export_data(filters_list):
+    return [
+        {
+            "name": f["name"], "reply_text": f.get("reply_text", ""),
+            "buttons": f.get("buttons", []), "file_id": f.get("file_id"),
+            "file_type": f.get("file_type"), "genre": f.get("genre"),
+            "entities": f.get("entities", []),
+        }
+        for f in filters_list
+    ]
+
+
+async def massexport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sudo-only: exports every chat's filters in one go -- one .json per
+    chat, all bundled into a single .zip -- instead of running /export
+    separately in each group."""
+    if update.effective_user.id not in SUDO_USERS:
+        await update.effective_message.reply_text("⚠️ This command is owner-only.")
+        return
+
+    status = await update.effective_message.reply_text("📦 Gathering filters from every chat...")
+
+    chat_ids = await filters_col.distinct("chat_id")
+    if not chat_ids:
+        await status.edit_text("No filters found anywhere yet.")
+        return
+
+    zip_buf = io.BytesIO()
+    total_filters = 0
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for cid in chat_ids:
+            filters_list = await list_filters(cid)
+            if not filters_list:
+                continue
+            export_data = _filters_to_export_data(filters_list)
+            total_filters += len(export_data)
+            try:
+                chat = await context.bot.get_chat(cid)
+                label = re.sub(r"[^\w\-]+", "_", chat.title or str(cid)).strip("_") or str(cid)
+            except Exception:
+                label = str(cid)
+            zf.writestr(f"filters_{label}_{cid}.json", json.dumps(export_data, indent=2))
+
+    zip_buf.seek(0)
+    zip_buf.name = "all_filters_export.zip"
+    await status.delete()
+    await update.effective_message.reply_document(
+        document=zip_buf, filename=zip_buf.name,
+        caption=f"📦 Exported {total_filters} filter(s) across {len(chat_ids)} chat(s).",
     )
 
 
@@ -960,6 +1141,7 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id, name=entry["name"], reply_text=entry.get("reply_text", ""),
             buttons=entry.get("buttons", []), file_id=entry.get("file_id"),
             file_type=entry.get("file_type"), genre=entry.get("genre"),
+            entities=entry.get("entities", []),
         )
         count += 1
     await message.reply_text(f"✅ Imported {count} filter(s).")
@@ -1152,6 +1334,7 @@ async def post_init(application: Application):
             BotCommand("fclone", "Enable/copy filter cloning"),
             BotCommand("export", "Export filters as .json"),
             BotCommand("import", "Import filters from backup"),
+            BotCommand("massexport", "Owner: export filters from every chat"),
             BotCommand("connect", "Connect your group"),
             BotCommand("connections", "Manage linked groups"),
             BotCommand("disconnect", "Disconnect your group"),
@@ -1193,6 +1376,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("import", import_cmd))
+    app.add_handler(CommandHandler("massexport", massexport_cmd))
 
     app.add_handler(CommandHandler("connect", connect_cmd))
     app.add_handler(CommandHandler("connections", connections_cmd))
