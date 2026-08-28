@@ -70,6 +70,7 @@ import re
 import json
 import io
 import zipfile
+import html
 import asyncio
 import logging
 import shlex
@@ -92,8 +93,8 @@ logger = logging.getLogger(__name__)
 #  works unchanged if you later deploy somewhere that injects them)
 # ============================================================
 
-BOT_TOKEN = "8838446349:AAEhJRJ8-KSG209UwnG6L8y0DZflyJczVq4"
-MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster00"
+BOT_TOKEN = "8838446349:AAGywumtan4XA-BMz6NMi9-f1Jrkh6VnJtM"
+MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster0"
 DB_NAME = "Alizenx"
 SUDO_USERS = [8536019525]
 
@@ -764,7 +765,6 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if reply_text:
         clean_text, parsed_buttons, clean_entities = parse_buttons_with_entities(reply_text, entity_dicts)
-        clean_entities = add_copy_link_entities(clean_text, clean_entities)
     else:
         clean_text, parsed_buttons, clean_entities = "", [], []
     all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
@@ -779,7 +779,12 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_label = target_chat.title or chat_id
     except Exception:
         chat_label = chat_id
-    await message.reply_text(f"✅ Filter '{name}' saved" + (f" in '{chat_label}'." if update.effective_chat.type == "private" else "."))
+    name_html = f"<code>{html.escape(name)}</code>"
+    chat_label_html = html.escape(str(chat_label))
+    await message.reply_text(
+        f"✅ Filter {name_html} saved" + (f" in '{chat_label_html}'." if update.effective_chat.type == "private" else "."),
+        parse_mode="HTML",
+    )
 
     # Log the FULL filter (text, buttons, and the actual media itself if any)
     # to the log channel -- not just the name -- so the log is a complete
@@ -819,7 +824,9 @@ async def del_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = tokens[0]
     ok = await delete_filter(chat_id, name)
     if ok:
-        await update.effective_message.reply_text(f"🗑 Filter '{name}' deleted.")
+        await update.effective_message.reply_text(
+            f"🗑 Filter <code>{html.escape(name)}</code> deleted.", parse_mode="HTML"
+        )
         await send_log(
             context,
             f"➖ Filter deleted: <code>{name}</code>\n"
@@ -1265,7 +1272,6 @@ async def autoaddfilter_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if raw_text:
         clean_text, parsed_buttons, clean_entities = parse_buttons_with_entities(raw_text, entity_dicts)
-        clean_entities = add_copy_link_entities(clean_text, clean_entities)
     else:
         clean_text, parsed_buttons, clean_entities = "", [], []
     all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
