@@ -52,6 +52,8 @@ source file.
 
 Commands:
     Core:        /add, /del, /filters, /deleteallfilters
+    Auto:        /autodel, /autoaddfilter (auto-save forwarded channel posts as filters)
+    Auth:        /auth, /unauth, /authusers (per-chat trusted-user whitelist)
     Auto mgmt:   /autodel on <sec> | off, /topfilters
     Cloning:     /fclone on|off, /fclone <source_id> <target_id>
     Buttons:     [Text](buttonurl:https://link) inside any /add reply text
@@ -91,7 +93,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BOT_TOKEN = "8838446349:AAEhJRJ8-KSG209UwnG6L8y0DZflyJczVq4"
-MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster0"
+MONGO_URI = "mongodb+srv://Alizenx:alizenx@cluster0.brrejva.mongodb.net/?appName=Cluster00"
 DB_NAME = "Alizenx"
 SUDO_USERS = [8536019525]
 
@@ -130,6 +132,7 @@ DEFAULT_SETTINGS = {
     "autodel_on": False,
     "autodel_sec": 60,
     "fclone_on": False,
+    "autoaddfilter_on": False,
 }
 
 # ============================================================
@@ -232,6 +235,19 @@ async def update_settings(chat_id: int, **kwargs):
     await chats_col.update_one({"chat_id": chat_id}, {"$set": kwargs}, upsert=True)
 
 
+async def add_auth_user(chat_id: int, user_id: int):
+    await chats_col.update_one({"chat_id": chat_id}, {"$addToSet": {"auth_users": user_id}}, upsert=True)
+
+
+async def remove_auth_user(chat_id: int, user_id: int):
+    await chats_col.update_one({"chat_id": chat_id}, {"$pull": {"auth_users": user_id}})
+
+
+async def get_auth_users(chat_id: int) -> list:
+    doc = await chats_col.find_one({"chat_id": chat_id})
+    return (doc or {}).get("auth_users", [])
+
+
 async def set_connection(user_id: int, group_id: int):
     await connections_col.update_one({"user_id": user_id}, {"$set": {"group_id": group_id}}, upsert=True)
 
@@ -251,6 +267,7 @@ async def remove_connection(user_id: int) -> bool:
 # ============================================================
 
 BUTTON_REGEX = re.compile(r"\[([^\[\]]+)\]\(buttonurl:(?://)?(.+?)\)", re.IGNORECASE)
+BARE_URL_REGEX = re.compile(r"(?<!\()\bhttps?://\S+", re.IGNORECASE)
 
 
 def _utf16_len(s: str) -> int:
@@ -402,6 +419,25 @@ def parse_buttons_with_entities(text: str, entity_dicts: list):
     return clean_text, rows, new_entities
 
 
+def add_copy_link_entities(text: str, entity_dicts: list):
+    """Marks any bare http(s) link still sitting in the plain text (i.e.
+    not already turned into a button via [Text](buttonurl:...)) as
+    monospace/code -- which is what makes Telegram let you copy it with a
+    single tap instead of opening it as a hyperlink. This is the behaviour
+    Rose-bot's filters have that a plain auto-linked URL doesn't."""
+    if not text:
+        return entity_dicts
+    new_entities = list(entity_dicts)
+    for match in BARE_URL_REGEX.finditer(text):
+        url_text = match.group(0).rstrip(").,!?\u200e")
+        if not url_text:
+            continue
+        offset = _utf16_len(text[:match.start()])
+        length = _utf16_len(url_text)
+        new_entities.append({"type": "code", "offset": offset, "length": length})
+    return new_entities
+
+
 def build_markup(buttons):
     """Accepts either the new row-grouped format (list of rows, each a list
     of [label, url]) or the old flat format (list of [label, url]) saved by
@@ -433,6 +469,63 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return True
     await update.effective_message.reply_text("⚠️ You need to be an admin in this chat to use this command.")
     return False
+
+
+async def require_owner_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Like require_admin_for_chat, but only the group's actual owner
+    (Telegram 'creator' status) or a bot sudo user is allowed through --
+    regular admins are refused. Used for destructive, chat-wide actions
+    like /deleteallfilters."""
+    message = update.effective_message
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
+        return None
+
+    user_id = update.effective_user.id
+    if user_id in SUDO_USERS:
+        return chat_id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        await message.reply_text("⚠️ Couldn't verify your role in that chat.")
+        return None
+    if member.status != "creator":
+        await message.reply_text("⚠️ Only the group's owner can use this command.")
+        return None
+    return chat_id
+
+
+async def require_admin_or_auth_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Like require_admin_for_chat, but also lets through users the group's
+    admins have specifically /auth'd -- Rose-style trusted-but-not-full-admin
+    helpers -- in addition to real admins and bot sudo users. Used for
+    /autoaddfilter."""
+    message = update.effective_message
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
+        return None
+
+    user_id = update.effective_user.id
+    if user_id in SUDO_USERS:
+        return chat_id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ("administrator", "creator"):
+            return chat_id
+    except Exception:
+        pass
+    if user_id in await get_auth_users(chat_id):
+        return chat_id
+    await message.reply_text("⚠️ You need to be an admin, or /auth'd, in this chat to use this command.")
+    return None
 
 
 async def resolve_target_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,7 +648,12 @@ HELP_TEXT = (
     "• /deleteallfilters — wipe all filters\n\n"
     "🗑 <b>Auto management</b>\n"
     "• /autodel <code>on sec | off</code>\n"
+    "• /autoaddfilter <code>on|off</code> — auto-save channel posts forwarded here as filters\n"
     "• /topfilters — most-used filters\n\n"
+    "🔐 <b>Authorization</b>\n"
+    "• /auth — reply to a user (or /auth user_id) to let them use /autoaddfilter without being admin\n"
+    "• /unauth — remove that authorization\n"
+    "• /authusers — list authorized users\n\n"
     "🔄 <b>Cloning</b>\n"
     "• /fclone <code>on|off</code>\n"
     "• /fclone <code>source_id target_id</code>\n\n"
@@ -666,6 +764,7 @@ async def add_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if reply_text:
         clean_text, parsed_buttons, clean_entities = parse_buttons_with_entities(reply_text, entity_dicts)
+        clean_entities = add_copy_link_entities(clean_text, clean_entities)
     else:
         clean_text, parsed_buttons, clean_entities = "", [], []
     all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
@@ -794,11 +893,63 @@ async def filters_page_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def delete_all_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = await require_admin_for_chat(update, context)
+    chat_id = await require_owner_for_chat(update, context)
     if chat_id is None:
         return
+
+    filters_list = await list_filters(chat_id)
+    if not filters_list:
+        await update.effective_message.reply_text("No filters to delete.")
+        return
+
+    chat_label = await get_chat_label(context, chat_id) if update.effective_chat.type == "private" else None
+    label_txt = f" in '{chat_label}'" if chat_label else ""
+    requester_id = update.effective_user.id
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete all", callback_data=f"delall_yes:{chat_id}:{requester_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"delall_no:{chat_id}:{requester_id}"),
+    ]])
+    await update.effective_message.reply_text(
+        f"⚠️ This will permanently delete all {len(filters_list)} filter(s){label_txt}.\n"
+        "A backup .json will be sent first, then everything will be wiped.\n\n"
+        "Are you sure?",
+        reply_markup=keyboard,
+    )
+
+
+async def delall_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, chat_id_str, requester_id_str = query.data.split(":")
+    chat_id, requester_id = int(chat_id_str), int(requester_id_str)
+
+    if query.from_user.id != requester_id and query.from_user.id not in SUDO_USERS:
+        await query.answer("Only the person who ran the command can confirm this.", show_alert=True)
+        return
+
+    if action == "delall_no":
+        await query.answer()
+        await query.edit_message_text("❎ Cancelled. No filters were deleted.")
+        return
+
+    await query.answer()
+    filters_list = await list_filters(chat_id)
+    if not filters_list:
+        await query.edit_message_text("No filters left to delete.")
+        return
+
+    # Always export a backup BEFORE wiping anything, so a mistaken or
+    # regretted delete-all is always recoverable via /import.
+    export_data = _filters_to_export_data(filters_list)
+    buf = io.BytesIO(json.dumps(export_data, indent=2).encode("utf-8"))
+    buf.name = f"filters_backup_{chat_id}.json"
+    await context.bot.send_document(
+        chat_id=query.message.chat.id, document=buf, filename=buf.name,
+        caption=f"📥 Backup of {len(export_data)} filter(s) before deletion.",
+    )
+
     count = await delete_all_filters(chat_id)
-    await update.effective_message.reply_text(f"🗑 Deleted {count} filter(s).")
+    await query.edit_message_text(f"🗑 Deleted {count} filter(s). Backup sent above.")
 
 
 async def _send_rendered_filter(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reply_text: str,
@@ -971,6 +1122,162 @@ async def autodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"🗑 Auto-delete enabled: filter replies vanish after {seconds}s.")
 
 
+def _extract_user_id_arg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    if context.args and context.args[0].lstrip("-").isdigit():
+        return int(context.args[0])
+    return None
+
+
+async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
+        return
+    target_id = _extract_user_id_arg(update, context)
+    if target_id is None:
+        await update.effective_message.reply_text(
+            "Reply to the user's message with /auth, or use /auth <user_id>."
+        )
+        return
+    await add_auth_user(chat_id, target_id)
+    await update.effective_message.reply_text(
+        f"✅ User {target_id} is now authorized to manage filter settings (like /autoaddfilter) in this chat."
+    )
+
+
+async def unauth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = await require_admin_for_chat(update, context)
+    if chat_id is None:
+        return
+    target_id = _extract_user_id_arg(update, context)
+    if target_id is None:
+        await update.effective_message.reply_text(
+            "Reply to the user's message with /unauth, or use /unauth <user_id>."
+        )
+        return
+    await remove_auth_user(chat_id, target_id)
+    await update.effective_message.reply_text(f"✅ User {target_id} is no longer authorized.")
+
+
+async def authusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = await resolve_target_chat_id(update, context)
+    if chat_id is None:
+        await update.effective_message.reply_text(
+            "⚠️ You're not connected to a group. Use /connect <group_id> here in DM first, "
+            "or run this command directly inside the group."
+        )
+        return
+    users = await get_auth_users(chat_id)
+    if not users:
+        await update.effective_message.reply_text("No authorized (/auth'd) users in this chat.")
+        return
+    await update.effective_message.reply_text("🔐 Authorized users:\n" + "\n".join(f"• {u}" for u in users))
+
+
+_LEADING_DECOR_RE = re.compile(r"^[^\w]+")
+
+
+def extract_autofilter_name(text: str) -> str:
+    """Pulls the filter name out of a channel post: its first non-empty
+    line, with any leading decorative symbol/emoji (⌬, ✿, ➤, ...) and
+    surrounding whitespace stripped -- e.g. '⌬ A Time Called You ' becomes
+    'A Time Called You'. The rest of the post (specs, credit line, links,
+    buttons) is untouched and saved as the filter's reply content."""
+    if not text:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return _LEADING_DECOR_RE.sub("", line).strip()
+    return ""
+
+
+async def autoaddfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        await update.effective_message.reply_text("Usage: /autoaddfilter on  |  /autoaddfilter off")
+        return
+
+    chat_id = await require_admin_or_auth_for_chat(update, context)
+    if chat_id is None:
+        return
+
+    enabled = args[0].lower() == "on"
+    await update_settings(chat_id, autoaddfilter_on=enabled)
+    if enabled:
+        await update.effective_message.reply_text(
+            "✅ Auto-add-filter is ON.\n"
+            "Any post forwarded here from a channel (or auto-posted from a linked channel) "
+            "will now be saved as a filter automatically -- using its first line as the "
+            "filter name, e.g. '⌬ A Time Called You' → filter 'A Time Called You'."
+        )
+    else:
+        await update.effective_message.reply_text("❎ Auto-add-filter is OFF.")
+
+
+async def autoaddfilter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Watches for posts forwarded into a group from a channel -- either a
+    manual forward or Telegram's automatic channel->linked-discussion-group
+    forward -- and, if /autoaddfilter is ON for that chat, saves it as a
+    filter by itself: no admin has to run /add for every single post."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    origin = getattr(message, "forward_origin", None)
+    is_channel_origin = False
+    if origin is not None:
+        is_channel_origin = getattr(origin, "type", None) == "channel" or hasattr(origin, "chat")
+    elif getattr(message, "forward_from_chat", None) is not None:
+        is_channel_origin = message.forward_from_chat.type == "channel"
+    if not is_channel_origin and not getattr(message, "is_automatic_forward", False):
+        return
+
+    settings = await get_settings(chat.id)
+    if not settings.get("autoaddfilter_on"):
+        return
+
+    raw_text = message.text or message.caption or ""
+    name = extract_autofilter_name(raw_text)
+    if not name:
+        return
+
+    entity_dicts = _entities_to_dicts(message.entities or message.caption_entities)
+
+    file_id, file_type = None, None
+    for ftype in FILE_TYPES:
+        media = getattr(message, ftype, None)
+        if media:
+            file_id = media[-1].file_id if isinstance(media, (list, tuple)) else media.file_id
+            file_type = ftype
+            break
+
+    original_buttons = []
+    if message.reply_markup and message.reply_markup.inline_keyboard:
+        for row in message.reply_markup.inline_keyboard:
+            row_buttons = [[btn.text, btn.url] for btn in row if getattr(btn, "url", None)]
+            if row_buttons:
+                original_buttons.append(row_buttons)
+
+    if raw_text:
+        clean_text, parsed_buttons, clean_entities = parse_buttons_with_entities(raw_text, entity_dicts)
+        clean_entities = add_copy_link_entities(clean_text, clean_entities)
+    else:
+        clean_text, parsed_buttons, clean_entities = "", [], []
+    all_buttons = parsed_buttons + [b for b in original_buttons if b not in parsed_buttons]
+
+    await add_filter(
+        chat_id=chat.id, name=name, reply_text=clean_text,
+        buttons=all_buttons, file_id=file_id, file_type=file_type,
+        entities=clean_entities,
+    )
+    await message.reply_text(f"🤖 Auto-saved as filter: '{name}'")
+
+
 async def top_filters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context)
     if chat_id is None:
@@ -1073,7 +1380,8 @@ def _filters_to_export_data(filters_list):
 async def massexport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sudo-only: exports every chat's filters in one go -- one .json per
     chat, all bundled into a single .zip -- instead of running /export
-    separately in each group."""
+    separately in each group. The zip is DMed to the owner (never posted
+    into a group), since it contains every connected group's filter data."""
     if update.effective_user.id not in SUDO_USERS:
         await update.effective_message.reply_text("⚠️ This command is owner-only.")
         return
@@ -1103,11 +1411,23 @@ async def massexport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     zip_buf.seek(0)
     zip_buf.name = "all_filters_export.zip"
-    await status.delete()
-    await update.effective_message.reply_document(
-        document=zip_buf, filename=zip_buf.name,
-        caption=f"📦 Exported {total_filters} filter(s) across {len(chat_ids)} chat(s).",
-    )
+
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_user.id, document=zip_buf, filename=zip_buf.name,
+            caption=f"📦 Exported {total_filters} filter(s) across {len(chat_ids)} chat(s).",
+        )
+    except Exception:
+        await status.edit_text(
+            "⚠️ Couldn't DM you the export -- please start a private chat with me first "
+            "(send /start in my DM), then run /massexport again."
+        )
+        return
+
+    if update.effective_chat.type == "private":
+        await status.delete()
+    else:
+        await status.edit_text(f"📦 Sent -- {total_filters} filter(s) across {len(chat_ids)} chat(s) exported to your DM.")
 
 
 async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1330,6 +1650,10 @@ async def post_init(application: Application):
             BotCommand("filters", "Show all filters"),
             BotCommand("deleteallfilters", "Delete all filters"),
             BotCommand("autodel", "Auto-delete replies"),
+            BotCommand("autoaddfilter", "Auto-save channel posts as filters"),
+            BotCommand("auth", "Authorize a user for bot settings"),
+            BotCommand("unauth", "Remove a user's authorization"),
+            BotCommand("authusers", "List authorized users"),
             BotCommand("topfilters", "View most-used filters"),
             BotCommand("fclone", "Enable/copy filter cloning"),
             BotCommand("export", "Export filters as .json"),
@@ -1363,6 +1687,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("donate", donate_cmd))
     app.add_handler(CallbackQueryHandler(help_center_callback, pattern="^help_center$"))
     app.add_handler(CallbackQueryHandler(filters_page_callback, pattern="^filterspage:"))
+    app.add_handler(CallbackQueryHandler(delall_confirm_callback, pattern="^delall_(yes|no):"))
 
     app.add_handler(CommandHandler("add", add_filter_cmd))
     app.add_handler(CommandHandler("del", del_filter_cmd))
@@ -1370,6 +1695,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("deleteallfilters", delete_all_filters_cmd))
 
     app.add_handler(CommandHandler("autodel", autodel_cmd))
+    app.add_handler(CommandHandler("autoaddfilter", autoaddfilter_cmd))
+    app.add_handler(CommandHandler("auth", auth_cmd))
+    app.add_handler(CommandHandler("unauth", unauth_cmd))
+    app.add_handler(CommandHandler("authusers", authusers_cmd))
     app.add_handler(CommandHandler("topfilters", top_filters_cmd))
 
     app.add_handler(CommandHandler("fclone", fclone_dispatch))
@@ -1384,6 +1713,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
     app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, filter_trigger_handler), group=0)
+    # Own group (not 0) so this runs alongside filter_trigger_handler above,
+    # rather than one silently blocking the other on the same forwarded post.
+    app.add_handler(MessageHandler(tg_filters.FORWARDED & tg_filters.ChatType.GROUPS, autoaddfilter_handler), group=1)
 
     # Logging: new members joining, and the bot itself being added to a group.
     app.add_handler(MessageHandler(tg_filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_member_cmd))
